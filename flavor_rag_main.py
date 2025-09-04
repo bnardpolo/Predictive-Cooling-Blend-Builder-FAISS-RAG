@@ -1,230 +1,353 @@
 # =========================================================
-# genai_flavor_rag.py  — Retrieval + Bitter Guard + LLM
+# genai_flavor_rag.py — S3-aware loaders + real shortlisting
+# - Accepts local paths OR S3 URIs in .env
+# - Downloads S3 files/dirs into .cache/ before loading
+# - Heuristic scoring: favor cooling, penalize bitterness, keyword match
+# - Fallback suggestions when no item meets thresholds
+# - Preset "pretrained choices" list for UI pickers
+# - Back-compat shim (INDEX_DIR, DATASET, etc.)
 # =========================================================
-import os, re, ast, json
-from typing import List, Dict, Any, Tuple
+import os, re
+from pathlib import Path
+from urllib.parse import urlparse
+from typing import Tuple, Optional, Dict, Any, List
 
-import pandas as pd
-import numpy as np
 import joblib
+import pandas as pd
 
-from dotenv import load_dotenv
-load_dotenv()  # for OPENAI_API_KEY
+try:
+    import boto3
+    from botocore.exceptions import NoCredentialsError, ClientError
+except Exception:
+    boto3 = None
 
-# -------------------- CONFIG --------------------
-BASE_DIR      = r"C:\Users\enhan\Desktop\Procter & Gamble"
-DATA_BASENAME = os.path.join(BASE_DIR, "flavor_kb_master")  # extension auto-detected
-MODEL_PATH    = os.path.join(BASE_DIR, "taste_model_randomforest.joblib")
-MLB_PATH      = os.path.join(BASE_DIR, "taste_label_binarizer.joblib")
-INDEX_DIR     = os.path.join(BASE_DIR, "faiss_index")
-BITTER_THRESH = 0.40
+from dotenv import load_dotenv, dotenv_values
 
-os.makedirs(BASE_DIR, exist_ok=True)
-os.makedirs(INDEX_DIR, exist_ok=True)
+# ---------- Project root + .env ----------
+HERE = Path(__file__).resolve()
+ROOT = HERE.parents[1] if HERE.parent.name == "src" else HERE.parent
+ENV_FILE = ROOT / ".env"
+if ENV_FILE.exists():
+    load_dotenv(ENV_FILE, override=True)
+    for k, v in dotenv_values(ENV_FILE).items():
+        if v is not None:
+            os.environ[k] = v
 
-# ---------------- File helpers ----------------
-def _resolve_data_path(basename: str) -> str:
-    candidates = [basename]
-    root, ext = os.path.splitext(basename)
-    if ext == "":
-        candidates += [root + ".csv", root + ".xlsx", root + ".xls"]
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-    raise FileNotFoundError(f"Data file not found. Tried: {candidates}")
+# ---------- Config ----------
+TASTE_MODEL_PATH       = os.getenv("TASTE_MODEL_PATH",       "")
+TASTE_LABEL_BINARIZER  = os.getenv("TASTE_LABEL_BINARIZER",  "")
+FLAVOR_DATASET         = os.getenv("FLAVOR_DATASET",         "")
+FAISS_INDEX_DIR        = os.getenv("FAISS_INDEX_DIR",        "")
 
-def _read_table_auto(basename: str) -> pd.DataFrame:
-    path = _resolve_data_path(basename)
-    ext = os.path.splitext(path)[1].lower()
-    if ext == ".csv":
-        return pd.read_csv(path)
-    return pd.read_excel(path)  # requires: pip install openpyxl
+CACHE_DIR = (ROOT / ".cache").resolve()
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# --------------- Normalization helpers ---------------
-_ALIAS_MAP = {
-    "name":        ["name", "compound", "molecule", "ingredient", "material", "compound_name"],
-    "aroma":       ["aroma", "aroma_clean", "aromas", "descriptor", "descriptors", "notes", "note"],
-    "smiles":      ["smiles", "smile", "smiles_string"],
-    "description": ["description", "desc", "details", "summary"],
-    "taste":       ["taste", "tastes", "taste_labels", "labels", "label", "tag", "tags"],
-}
+# ---------- S3 helpers ----------
+def _is_s3_uri(uri: str) -> bool:
+    return isinstance(uri, str) and uri.strip().lower().startswith("s3://")
 
-def _to_lower_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df2 = df.copy()
-    df2.columns = [str(c).strip().lower() for c in df2.columns]
-    return df2
+def _parse_s3_uri(uri: str) -> Tuple[str, str]:
+    parsed = urlparse(uri)
+    bucket = parsed.netloc
+    key = parsed.path.lstrip("/")
+    if not bucket or not key:
+        raise ValueError(f"Invalid S3 URI: {uri}")
+    return bucket, key
 
-def _ensure_canonical_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = _to_lower_cols(df)
-    for canon, aliases in _ALIAS_MAP.items():
-        if canon in df.columns:
-            continue
-        for a in aliases:
-            if a in df.columns:
-                df[canon] = df[a]
-                break
-        if canon not in df.columns:
-            df[canon] = ""  # empty fallback
-    return df
+def _require_boto3():
+    if boto3 is None:
+        raise RuntimeError("boto3 not available. pip install boto3; configure creds via 'aws configure'.")
 
-def _safe_str(x: Any) -> str:
-    return "" if x is None or (isinstance(x, float) and pd.isna(x)) else str(x)
+def _s3_client():
+    _require_boto3()
+    try:
+        return boto3.client("s3")
+    except NoCredentialsError:
+        raise RuntimeError("AWS credentials not found. Run 'aws configure'.")
 
-# --------------- Taste model helpers ---------------
-def _parse_list_like(x) -> List[str]:
-    if x is None or (isinstance(x, float) and pd.isna(x)): return []
-    if isinstance(x, list): return [str(i).strip() for i in x if str(i).strip()]
-    if isinstance(x, str):
-        s = x.strip()
-        if (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")")):
-            try:
-                val = ast.literal_eval(s)
-                if isinstance(val, (list, tuple)):
-                    return [str(i).strip() for i in val if str(i).strip()]
-            except Exception:
-                pass
-        parts = re.split(r"[;,]\s*", s)
-        return [p.strip() for p in parts if p.strip()]
-    return [str(x).strip()]
+def ensure_local_file(path_or_s3: str, prefer_name: Optional[str] = None) -> Path:
+    if not path_or_s3:
+        raise FileNotFoundError("Empty path provided for artifact.")
+    if _is_s3_uri(path_or_s3):
+        bucket, key = _parse_s3_uri(path_or_s3)
+        filename = prefer_name or Path(key).name
+        local_path = CACHE_DIR / filename
+        if not local_path.exists():
+            s3 = _s3_client()
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            s3.download_file(bucket, key, str(local_path))
+        return local_path
+    p = Path(path_or_s3).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"Local file not found: {p}")
+    return p
 
-def load_taste_model() -> Tuple[Any, Any]:
-    rf = joblib.load(MODEL_PATH)
-    mlb = joblib.load(MLB_PATH)
+def ensure_local_dir(dir_or_s3_prefix: str) -> Path:
+    if not dir_or_s3_prefix:
+        raise FileNotFoundError("Empty directory/prefix provided for index.")
+    if _is_s3_uri(dir_or_s3_prefix):
+        bucket, prefix = _parse_s3_uri(dir_or_s3_prefix)
+        folder_name = Path(prefix.rstrip("/")).name or "s3_dir"
+        local_dir = CACHE_DIR / folder_name
+        if not local_dir.exists() or not any(local_dir.iterdir()):
+            local_dir.mkdir(parents=True, exist_ok=True)
+            s3 = _s3_client()
+            paginator = s3.get_paginator("list_objects_v2")
+            found = False
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix.rstrip("/") + "/"):
+                for obj in page.get("Contents", []):
+                    found = True
+                    key = obj["Key"]
+                    rel = Path(key[len(prefix):].lstrip("/"))
+                    target = local_dir / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    s3.download_file(bucket, key, str(target))
+            if not found:
+                # prefix might actually be a single file
+                file_target = local_dir / Path(prefix).name
+                s3.download_file(bucket, prefix, str(file_target))
+        return local_dir
+    d = Path(dir_or_s3_prefix).expanduser().resolve()
+    if not d.exists():
+        raise FileNotFoundError(f"Local directory not found: {d}")
+    return d
+
+# ---------- Loaders ----------
+def load_taste_model():
+    model_local = ensure_local_file(TASTE_MODEL_PATH, prefer_name="taste_model_randomforest.joblib")
+    mlb_local   = ensure_local_file(TASTE_LABEL_BINARIZER, prefer_name="taste_label_binarizer.joblib")
+    rf  = joblib.load(str(model_local))
+    mlb = joblib.load(str(mlb_local))
     return rf, mlb
 
-def predict_taste_probs(model, mlb, name: str, aroma: str, smiles: str) -> Dict[str, float]:
-    text = f"{_safe_str(name)} {_safe_str(aroma)} {_safe_str(smiles)}".strip()
-    proba_matrix = model.predict_proba([text])
-    probs = [float(p) for p in proba_matrix[0]]
-    return dict(zip(mlb.classes_.tolist(), probs))
+def load_flavor_dataset() -> pd.DataFrame:
+    local = ensure_local_file(FLAVOR_DATASET)
+    if local.suffix.lower() in {".xlsx", ".xls"}:
+        df = pd.read_excel(local)
+    else:
+        df = pd.read_csv(local)
+    # Normalize common columns
+    # Expected columns: name, aroma (string), taste (string), cool_score, bitter_prob (float-ish)
+    # If arrays are stored as JSON-ish strings, keep as raw text for regex matching.
+    for col in ["name", "aroma", "taste"]:
+        if col not in df.columns:
+            # best-effort aliases
+            if col == "name":
+                for alt in ["Name", "compound", "Compound"]:
+                    if alt in df.columns:
+                        df[col] = df[alt]
+                        break
+            elif col == "aroma":
+                for alt in ["Aroma", "aroma_notes", "aroma_list"]:
+                    if alt in df.columns:
+                        df[col] = df[alt]
+                        break
+            elif col == "taste":
+                for alt in ["Taste", "taste_notes", "taste_list"]:
+                    if alt in df.columns:
+                        df[col] = df[alt]
+                        break
+            if col not in df.columns:
+                df[col] = ""
+    if "cool_score" not in df.columns:
+        # derive a naive cool score from keywords if missing
+        def _cool_from_text(a, t):
+            text = f"{a} {t}".lower()
+            return 1.0 if "cool" in text or "menthol" in text or "mint" in text else 0.0
+        df["cool_score"] = [ _cool_from_text(a, t) for a, t in zip(df["aroma"].astype(str), df["taste"].astype(str)) ]
+    if "bitter_prob" not in df.columns:
+        # default unknown bitterness to mid value
+        df["bitter_prob"] = 0.5
+    return df
 
-def passes_bitter_guard(probs: Dict[str, float], threshold: float = BITTER_THRESH) -> bool:
-    return probs.get("Bitter", 0.0) < threshold
+def get_faiss_index_dir() -> Path:
+    return ensure_local_dir(FAISS_INDEX_DIR)
 
-# ---------------- LangChain / FAISS ----------------
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain.vectorstores import FAISS
-from langchain.docstore.document import Document
-from langchain.schema import SystemMessage, HumanMessage, AIMessage
+# ---------- Intent / scope helpers ----------
+_SCOPE_KEYWORDS = {
+    "dessert": ["dessert", "ice cream", "cake", "frosting", "creamy", "vanilla", "sweet"],
+    "herbal":  ["herbal", "herb", "camphor", "eucalyptus", "rosemary", "sage"],
+    "mint":    ["mint", "menthol", "peppermint", "menthyl", "cool"],
+}
 
-def _row_to_doc(row: Dict[str, Any]) -> Document:
-    name   = _safe_str(row.get("name", ""))
-    aromaV = row.get("aroma", "")
-    aroma  = " ".join(_parse_list_like(aromaV)) if not isinstance(aromaV, str) else _safe_str(aromaV)
-    smiles = _safe_str(row.get("smiles", ""))
-    desc   = _safe_str(row.get("description", ""))
-    taste  = row.get("taste", "")
-    taste_list = _parse_list_like(taste) if not isinstance(taste, list) else taste
+def _infer_scope(goal_text: str) -> str:
+    text = goal_text.lower()
+    for scope, kws in _SCOPE_KEYWORDS.items():
+        if any(k in text for k in kws):
+            return scope
+    return "generic"
 
-    blocks = []
-    if name:   blocks.append(f"Name: {name}")
-    if aroma:  blocks.append(f"Aroma: {aroma}")
-    if smiles: blocks.append(f"SMILES: {smiles}")
-    if desc:   blocks.append(f"Description: {desc}")
-    if taste_list: blocks.append(f"Known tastes: {', '.join(taste_list)}")
-    text = "\n".join(blocks).strip() or json.dumps({k: _safe_str(v) for k,v in row.items()}, ensure_ascii=False)
+# ---------- Candidate scoring ----------
+def _keyword_score(text: str, goal_text: str) -> float:
+    if not text:
+        return 0.0
+    text = str(text).lower()
+    words = [w for w in re.findall(r"[a-z]+", goal_text.lower()) if len(w) > 2]
+    if not words:
+        return 0.0
+    hits = sum(1 for w in words if w in text)
+    return hits / max(4, len(words))  # dampen long prompts
 
-    meta = {"name": name, "aroma": aroma, "smiles": smiles, "description": desc, "taste_labels": taste_list}
-    return Document(page_content=text, metadata=meta)
+def shortlist_candidates(
+    df: pd.DataFrame,
+    goal_text: str,
+    bitter_thresh: float = 0.40,
+    min_cool: float = 0.15,
+    top_k: int = 12,
+) -> List[Dict[str, Any]]:
+    scope = _infer_scope(goal_text)
+    # bias keywords per scope
+    extra = []
+    if scope == "dessert":
+        extra = ["vanilla", "creamy", "sweet", "buttery", "cake"]
+    elif scope == "herbal":
+        extra = ["herbal", "camphor", "eucalyptus", "sage", "rosemary"]
+    elif scope == "mint":
+        extra = ["mint", "menthol", "menthyl", "peppermint", "cool"]
 
-def build_or_load_vectorstore(df: pd.DataFrame) -> FAISS:
-    df = _ensure_canonical_columns(df)
-    total = len(df)
-    print(f"[Index] rows={total} | name>0: {int((df['name'].astype(str).str.strip()!='').sum())} | "
-          f"aroma>0: {int((df['aroma'].astype(str).str.strip()!='').sum())} | smiles>0: {int((df['smiles'].astype(str).str.strip()!='').sum())}")
-    docs = [_row_to_doc(r) for _, r in df.iterrows()]
-    docs = [d for d in docs if d.page_content.strip()]
-    if not docs: raise ValueError("No documents to index. Check dataset columns.")
+    def score_row(row):
+        aroma = str(row["aroma"])
+        taste = str(row["taste"])
+        txt = f"{aroma} {taste}"
+        kcore = _keyword_score(txt, goal_text)
+        kextra = _keyword_score(txt, " ".join(extra)) if extra else 0.0
+        cool = float(row.get("cool_score", 0.0) or 0.0)
+        bitter = float(row.get("bitter_prob", 0.5) or 0.5)
+        # score: prefer cool, penalize bitter, plus keyword alignment
+        return 0.6 * cool - 0.5 * bitter + 0.6 * kcore + 0.3 * kextra
 
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-    vs = FAISS.from_documents(docs, embeddings)
-    vs.save_local(INDEX_DIR)
-    return vs
+    # filter first by thresholds
+    filtered = df[
+        (df["bitter_prob"].astype(float) <= bitter_thresh) &
+        (df["cool_score"].astype(float) >= min_cool)
+    ].copy()
 
-def load_vectorstore() -> FAISS:
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-    return FAISS.load_local(INDEX_DIR, embeddings, allow_dangerous_deserialization=True)
+    # If filtered is empty, consider full df for suggestions later
+    target = filtered if len(filtered) else df
 
-def retrieve_mmr(vs: FAISS, query: str, k: int = 12, fetch_k: int = 24) -> List[Document]:
-    retriever = vs.as_retriever(search_type="mmr", search_kwargs={"k": k, "fetch_k": fetch_k, "lambda_mult": 0.5})
-    return retriever.invoke(query)
+    target["__score__"] = target.apply(score_row, axis=1)
+    ranked = target.sort_values("__score__", ascending=False).head(int(top_k))
 
-# ---------------- LLM compose ----------------
-SYSTEM = """You are a flavor scientist. Use ONLY the provided SAFE candidates (already filtered for Bitter).
-Combine 1–3 candidates to match the user's goal. Be concise and pragmatic.
-Return bullets with % ranges and a one-line rationale. Do not warn about bitterness."""
+    results = []
+    for _, r in ranked.iterrows():
+        results.append({
+            "name": r.get("name", ""),
+            "aroma": r.get("aroma", ""),
+            "taste": r.get("taste", ""),
+            "cool_score": float(r.get("cool_score", 0.0) or 0.0),
+            "bitter_prob": float(r.get("bitter_prob", 0.5) or 0.5),
+            "score": float(r["__score__"]),
+            "reason": f"cool={float(r.get('cool_score',0)):0.2f}, bitter={float(r.get('bitter_prob',0.5)):0.2f}, match≈{_keyword_score(f'{r.get('aroma','')} {r.get('taste','')}', goal_text):0.2f}",
+        })
+    return results
 
-def compose_with_llm(query: str, safe_items: List[Dict[str, Any]], threshold: float) -> str:
-    # Build context (works for both LLM and fallback)
-    ctx_lines = [f"User goal: {query}", f"Bitter threshold: {threshold}"]
-    for i, item in enumerate(safe_items[:8], 1):
-        m = item["doc"].metadata
-        ctx_lines.append(
-            f"\nCandidate {i}:\n"
-            f"- Name: {m.get('name','')}\n"
-            f"- Aroma: {m.get('aroma','')}\n"
-            f"- SMILES: {m.get('smiles','')}\n"
-            f"- Known tastes: {', '.join(m.get('taste_labels', []))}\n"
-            f"- Predicted probs: {json.dumps(item['probs'])}"
-        )
-    context = "\n".join(ctx_lines)
+# ---------- Preset (“pretrained”) choices ----------
+def preset_choices(df: pd.DataFrame, limit: int = 25) -> List[str]:
+    # top cool / low bitter “safe” starting points
+    df2 = df.copy()
+    df2["cool_score"] = df2["cool_score"].astype(float)
+    df2["bitter_prob"] = df2["bitter_prob"].astype(float)
+    df2["__rank__"] = (0.8 * df2["cool_score"] - 0.6 * df2["bitter_prob"])
+    out = (
+        df2.sort_values("__rank__", ascending=False)
+           .head(int(limit))
+           .get("name", pd.Series([], dtype=str))
+           .dropna()
+           .astype(str)
+           .tolist()
+    )
+    return out
 
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        names = [it["doc"].metadata.get("name","") for it in safe_items[:3]]
-        return (
-            f"(No LLM key) Suggested blend from safe picks: {', '.join([n for n in names if n]) or 'N/A'}.\n"
-            f"Rationale: chosen for the target profile while keeping Bitter<{threshold}. "
-            f"Set OPENAI_API_KEY to get a polished composition."
-        )
+# ---------- Environment check ----------
+def environment_check() -> Dict[str, Any]:
+    results: Dict[str, Any] = {}
+    for key, val in {
+        "TASTE_MODEL_PATH": TASTE_MODEL_PATH,
+        "TASTE_LABEL_BINARIZER": TASTE_LABEL_BINARIZER,
+        "FLAVOR_DATASET": FLAVOR_DATASET,
+        "FAISS_INDEX_DIR": FAISS_INDEX_DIR,
+    }.items():
+        try:
+            if key == "FAISS_INDEX_DIR":
+                path = ensure_local_dir(val)
+            else:
+                path = ensure_local_file(val)
+            results[key] = {"configured": val, "local_resolved": str(path), "exists": path.exists()}
+        except Exception as e:
+            results[key] = {"configured": val, "error": str(e), "exists": False}
+    return results
 
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
-    msgs = [SystemMessage(content=SYSTEM),
-            HumanMessage(content=f"{context}\n\nPropose the blend now: bullets + brief rationale.")]
-    resp = llm.invoke(msgs)
-    return resp.content if isinstance(resp, AIMessage) else str(resp)
+# ---------- Main facade the UI calls ----------
+def answer(
+    goal_text: str,
+    top_k: int = 12,
+    bitter_thresh: float = 0.40,
+    min_cool: float = 0.15,
+    exact_compounds: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Returns a shortlist and helpful messages. Falls back to suggestions if none pass thresholds.
+    """
+    df = load_flavor_dataset()
 
-# ---------------- Public API ----------------
-def answer(query: str, top_k: int = 12) -> Dict[str, Any]:
-    # Load model + KB (build index if missing)
-    rf, mlb = load_taste_model()
+    scope = _infer_scope(goal_text)
+    scope_msg = ""
+    if "ice cream" in goal_text.lower() or "cake" in goal_text.lower():
+        scope_msg = "Dessert-like profile requested; prioritizing creamy/vanilla/sweet notes."
+
+    # If user picked exact compounds, filter df first to those
+    if exact_compounds:
+        df_view = df[df["name"].astype(str).isin([str(x) for x in exact_compounds])].copy()
+        if df_view.empty:
+            return {
+                "shortlist": [],
+                "suggestions": [],
+                "message": "Selected compounds were not found in the dataset.",
+                "scope": scope,
+                "scope_note": scope_msg,
+                "preset_choices": preset_choices(df)
+            }
+    else:
+        df_view = df
+
+    picks = shortlist_candidates(df_view, goal_text, bitter_thresh, min_cool, top_k)
+
+    if picks:
+        return {
+            "shortlist": picks,
+            "suggestions": [],
+            "message": f"Found {len(picks)} candidates meeting (cool ≥ {min_cool}, bitter ≤ {bitter_thresh}).",
+            "scope": scope,
+            "scope_note": scope_msg,
+            "preset_choices": preset_choices(df)
+        }
+
+    # No items met thresholds → provide suggestions (best-effort)
+    fallback = shortlist_candidates(df, goal_text, bitter_thresh=1.0, min_cool=0.0, top_k=top_k)
+    msg = (
+        "No compounds matched your thresholds. "
+        "Here are the nearest options—consider raising min cool or relaxing bitterness."
+    )
+    return {
+        "shortlist": [],
+        "suggestions": fallback,
+        "message": msg,
+        "scope": scope,
+        "scope_note": scope_msg,
+        "preset_choices": preset_choices(df)
+    }
+
+# ---------------- Back-compat shim for existing UI ----------------
+def _safe(path: str) -> str:
     try:
-        vs = load_vectorstore()
+        return str(ensure_local_file(path))
     except Exception:
-        df = _read_table_auto(DATA_BASENAME)
-        vs = build_or_load_vectorstore(df)
+        return "(unresolved)"
 
-    # Retrieve + guard
-    docs = retrieve_mmr(vs, query, k=top_k, fetch_k=max(2*top_k, 24))
-    safe = []
-    for d in docs:
-        m = d.metadata or {}
-        probs = predict_taste_probs(rf, mlb, m.get("name",""), m.get("aroma",""), m.get("smiles",""))
-        if passes_bitter_guard(probs, BITTER_THRESH):
-            safe.append({"doc": d, "probs": probs})
-
-    if not safe:
-        # Diagnostics: show nearest with their bitter scores
-        closest = []
-        for d in docs[:5]:
-            m = d.metadata or {}
-            p = predict_taste_probs(rf, mlb, m.get("name",""), m.get("aroma",""), m.get("smiles",""))
-            closest.append({"name": m.get("name",""), "aroma": m.get("aroma",""), "bitter": p.get("Bitter", 0.0), "probs": p})
-        return {"ok": False, "message": f"No candidates passed Bitter<{BITTER_THRESH}. Try raising threshold or revising the query.", "closest": closest}
-
-    blend_text = compose_with_llm(query, safe, BITTER_THRESH)
-    shortlist = [{
-        "name": it["doc"].metadata.get("name",""),
-        "aroma": it["doc"].metadata.get("aroma",""),
-        "smiles": it["doc"].metadata.get("smiles",""),
-        "probs": it["probs"]
-    } for it in safe[:8]]
-
-    return {"ok": True, "blend_text": blend_text, "shortlist": shortlist}
-
-# ---------------- CLI demo ----------------
-if __name__ == "__main__":
-    print(f"Resolving dataset from: {_resolve_data_path(DATA_BASENAME)}")
-    demo_query = "Design a cooling, minty mouthfeel for a sugar-free gum with a clean aftertaste."
-    out = answer(demo_query, top_k=12)
-    print(json.dumps(out, indent=2))
+try:
+    INDEX_DIR = str(ensure_local_dir(FAISS_INDEX_DIR)) if FAISS_INDEX_DIR else "(unresolved)"
+except Exception:
+    INDEX_DIR = "(unresolved)"
+DATASET = _safe(FLAVOR_DATASET) if FLAVOR_DATASET else "(unresolved)"
+MODEL_PATH = _safe(TASTE_MODEL_PATH) if TASTE_MODEL_PATH else "(unresolved)"
+LABEL_BINARIZER_PATH = _safe(TASTE_LABEL_BINARIZER) if TASTE_LABEL_BINARIZER else "(unresolved)"
