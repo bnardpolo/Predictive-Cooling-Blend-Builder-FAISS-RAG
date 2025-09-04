@@ -1,0 +1,9 @@
+Astringent
+Bitter
+Cool
+Pungent
+Salty
+Sour
+Sweet
+Tasteless
+Umami
