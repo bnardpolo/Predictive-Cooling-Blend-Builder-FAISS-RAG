@@ -1,12 +1,4 @@
-# =========================================================
-# genai_flavor_rag.py — S3-aware loaders + real shortlisting
-# - Accepts local paths OR S3 URIs in .env
-# - Downloads S3 files/dirs into .cache/ before loading
-# - Heuristic scoring: favor cooling, penalize bitterness, keyword match
-# - Fallback suggestions when no item meets thresholds
-# - Preset "pretrained choices" list for UI pickers
-# - Back-compat shim (INDEX_DIR, DATASET, etc.)
-# =========================================================
+
 import os, re
 from pathlib import Path
 from urllib.parse import urlparse
